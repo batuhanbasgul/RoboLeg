@@ -1,7 +1,6 @@
 //Batuhan BAŞGÜL
 //batuhanbasgul@gmail.com
 
-
 #include "stm32f4xx.h"
 #include "stm32f4_discovery.h"
 void BackwardPWM(uint8_t pwmPulse);
