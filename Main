@@ -1,0 +1,442 @@
+#include "stm32f4xx.h"
+#include "stm32f4_discovery.h"
+void BackwardPWM(uint8_t pwmPulse);
+void ForwardPWM(uint8_t pwmPulse);
+void StopMotor(void);
+void MoveForward(uint8_t ui8_Pulse);
+void MoveBackward(uint8_t ui8_Pulse);
+void DelayMs(uint16_t delayTime_MS);
+void ResetMotor(void);
+
+GPIO_InitTypeDef GPIO_Struct;
+ADC_InitTypeDef ADC_Struct;
+ADC_CommonInitTypeDef ADC_CommonStruct;
+TIM_TimeBaseInitTypeDef TIM_Struct;
+TIM_OCInitTypeDef TIM_OCStruct;
+EXTI_InitTypeDef EXTI_Struct;
+NVIC_InitTypeDef NVIC_Struct;
+
+#define THRESHOLD 144
+#define RATIO 32
+#define GAP 16
+#define COLLISION 8
+
+uint16_t ui16_delayCounter=0;
+int16_t i16_pwmPulse=0;
+uint8_t ui8_ADCData_EMG1,ui8_ADCData_EMG2,ui8_EMG1LOG,ui8_EMG2LOG;
+uint8_t ui8_EMGSignalDifference,ui8_loopCounter=0,ui8_resetFlag=0;
+
+
+struct LOG{
+	uint8_t STATUS:1;				//0-Forward,1-Backward
+	uint8_t PWMLOG:7;				//Previous PWM Signal
+}LOG_Struct;						//Motor Movement Log for driving it.
+
+void Config_GPIO(void){
+
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOB,ENABLE);
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOC,ENABLE);
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOD,ENABLE);
+
+	//Pc4-5 CHANNEL0-CHANNEL1, ADC2 
+	GPIO_Struct.GPIO_Mode=GPIO_Mode_AN;
+	GPIO_Struct.GPIO_OType=GPIO_OType_PP;
+	GPIO_Struct.GPIO_Pin=GPIO_Pin_4|GPIO_Pin_5;
+	GPIO_Struct.GPIO_PuPd=GPIO_PuPd_NOPULL;
+	GPIO_Struct.GPIO_Speed=GPIO_Speed_100MHz;
+	GPIO_Init(GPIOC,&GPIO_Struct);
+
+	//PWM, R-EMG PC6, L-EMG PC7
+	GPIO_Struct.GPIO_Mode=GPIO_Mode_AF;
+	GPIO_Struct.GPIO_OType=GPIO_OType_PP;
+	GPIO_Struct.GPIO_Pin=GPIO_Pin_6|GPIO_Pin_7;
+	GPIO_Struct.GPIO_PuPd=GPIO_PuPd_NOPULL;
+	GPIO_Struct.GPIO_Speed=GPIO_Speed_100MHz;
+	GPIO_Init(GPIOC,&GPIO_Struct);
+
+	GPIO_PinAFConfig(GPIOC,GPIO_PinSource6,GPIO_AF_TIM3);
+	GPIO_PinAFConfig(GPIOC,GPIO_PinSource7,GPIO_AF_TIM3);
+
+	//EXTI PB2 limitation, PB3 switch, PB4 for forward, PB5 for backward
+	GPIO_Struct.GPIO_Mode=GPIO_Mode_IN;
+	GPIO_Struct.GPIO_OType=GPIO_OType_PP;
+	GPIO_Struct.GPIO_Pin=GPIO_Pin_2|GPIO_Pin_3|GPIO_Pin_4|GPIO_Pin_5;
+	GPIO_Struct.GPIO_PuPd=GPIO_PuPd_DOWN;
+	GPIO_Struct.GPIO_Speed=GPIO_Speed_100MHz;
+	GPIO_Init(GPIOB,&GPIO_Struct);
+
+	//EMG supply output PORTD
+	GPIO_Struct.GPIO_Mode=GPIO_Mode_OUT;
+	GPIO_Struct.GPIO_OType=GPIO_OType_PP;
+	GPIO_Struct.GPIO_Pin=GPIO_Pin_0|GPIO_Pin_1|GPIO_Pin_2;
+	GPIO_Struct.GPIO_PuPd=GPIO_PuPd_NOPULL;
+	GPIO_Struct.GPIO_Speed=GPIO_Speed_50MHz;
+	GPIO_Init(GPIOD,&GPIO_Struct);
+	GPIO_ResetBits(GPIOD,GPIO_Pin_0|GPIO_Pin_1|GPIO_Pin_2);
+
+}
+
+void Config_EXTI(void){
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_SYSCFG,ENABLE);
+	SYSCFG_EXTILineConfig(EXTI_PortSourceGPIOB,EXTI_PinSource2);
+	SYSCFG_EXTILineConfig(EXTI_PortSourceGPIOB,EXTI_PinSource3);
+
+	EXTI_Struct.EXTI_Line=EXTI_Line2;
+	EXTI_Struct.EXTI_LineCmd=ENABLE;
+	EXTI_Struct.EXTI_Mode=EXTI_Mode_Interrupt;
+	EXTI_Struct.EXTI_Trigger=EXTI_Trigger_Rising;
+	EXTI_Init(&EXTI_Struct);
+
+	EXTI_Struct.EXTI_Line=EXTI_Line3;
+	EXTI_Struct.EXTI_LineCmd=ENABLE;
+	EXTI_Struct.EXTI_Mode=EXTI_Mode_Interrupt;
+	EXTI_Struct.EXTI_Trigger=EXTI_Trigger_Rising;
+	EXTI_Init(&EXTI_Struct);
+
+	NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
+
+	NVIC_Struct.NVIC_IRQChannel=EXTI2_IRQn;
+	NVIC_Struct.NVIC_IRQChannelCmd=ENABLE;
+	NVIC_Struct.NVIC_IRQChannelPreemptionPriority=0x00;
+	NVIC_Struct.NVIC_IRQChannelSubPriority=0x00;
+	NVIC_Init(&NVIC_Struct);
+
+	NVIC_Struct.NVIC_IRQChannel=EXTI3_IRQn;
+	NVIC_Struct.NVIC_IRQChannelCmd=ENABLE;
+	NVIC_Struct.NVIC_IRQChannelPreemptionPriority=0x01;
+	NVIC_Struct.NVIC_IRQChannelSubPriority=0x00;
+	NVIC_Init(&NVIC_Struct);
+}
+
+void Config_TIM3(void){
+	RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM3,ENABLE);
+	TIM_Struct.TIM_ClockDivision=TIM_CKD_DIV1;
+	TIM_Struct.TIM_CounterMode=TIM_CounterMode_Up;
+	TIM_Struct.TIM_Period=99;
+	TIM_Struct.TIM_Prescaler=4199;
+	TIM_Struct.TIM_RepetitionCounter=0;
+	TIM_TimeBaseInit(TIM3,&TIM_Struct);
+	TIM_Cmd(TIM3,ENABLE);
+
+	TIM_OCStruct.TIM_OCMode=TIM_OCMode_PWM1;
+	TIM_OCStruct.TIM_OCPolarity=TIM_OCPolarity_High;
+	TIM_OCStruct.TIM_OutputState=TIM_OutputState_Enable;
+
+}
+
+void Config_ADC2(void){
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_ADC2,ENABLE);
+
+	ADC_Struct.ADC_Resolution=ADC_Resolution_8b;
+	ADC_Struct.ADC_DataAlign=ADC_DataAlign_Right;
+	ADC_Init(ADC2,&ADC_Struct);
+
+	ADC_CommonStruct.ADC_Mode=ADC_Mode_Independent;
+	ADC_CommonStruct.ADC_Prescaler=ADC_Prescaler_Div4;
+	ADC_CommonStruct.ADC_TwoSamplingDelay=ADC_TwoSamplingDelay_20Cycles;
+	ADC_CommonInit(&ADC_CommonStruct);
+
+	ADC_Cmd(ADC2,ENABLE);
+}
+
+void SysTick_Handler(void){
+	if(ui16_delayCounter>0){
+		ui16_delayCounter--;		
+	}
+}
+	
+void EXTI2_IRQHandler(void){					//PB2 input-Limit
+	if(EXTI_GetITStatus(EXTI_Line2)!=RESET){
+		ui8_resetFlag=SET;
+		while(GPIO_ReadInputDataBit(GPIOB,GPIO_Pin_2)){
+			ForwardPWM(0);
+			BackwardPWM(0);
+		}
+		ui16_delayCounter=RESET;
+		ResetMotor();
+		EXTI_ClearITPendingBit(EXTI_Line2);
+	}
+}
+
+void EXTI3_IRQHandler(void){					//PB3 input - Power Control
+	ui8_resetFlag=SET;
+	if(EXTI_GetITStatus(EXTI_Line3)!=RESET){
+		ForwardPWM(0);
+		BackwardPWM(0);									
+		while(GPIO_ReadInputDataBit(GPIOB,GPIO_Pin_3)){
+			if(GPIO_ReadInputDataBit(GPIOB,GPIO_Pin_4)){
+				BackwardPWM(0);
+				ForwardPWM(50);
+			}else if(GPIO_ReadInputDataBit(GPIOB,GPIO_Pin_5)){
+				BackwardPWM(50);
+				ForwardPWM(0);
+			}else{
+				ForwardPWM(0);
+				BackwardPWM(0);
+			}
+		}
+		ResetMotor();
+		ui16_delayCounter=RESET;
+		EXTI_ClearITPendingBit(EXTI_Line3);
+	}
+}
+
+uint8_t ADC2_ReadEMG1(void){					//BACKWARD PC4
+	ADC_RegularChannelConfig(ADC2,ADC_Channel_14,1,ADC_SampleTime_56Cycles);
+	ADC_SoftwareStartConv(ADC2);
+	while(ADC_GetFlagStatus(ADC2,ADC_FLAG_EOC)==RESET);
+	return ADC_GetConversionValue(ADC2);
+}
+
+uint8_t ADC2_ReadEMG2(void){					//FORWARD PC5
+	ADC_RegularChannelConfig(ADC2,ADC_Channel_15,1,ADC_SampleTime_56Cycles);
+	ADC_SoftwareStartConv(ADC2);
+	while(ADC_GetFlagStatus(ADC2,ADC_FLAG_EOC)==RESET);
+	return ADC_GetConversionValue(ADC2);
+}
+
+uint16_t MAP(uint8_t ui8_Data,uint8_t ui8_dataMin,uint8_t ui8_dataMax,uint16_t ui16_returnMin,uint16_t ui16_returnMax){
+	return ((ui8_Data*ui16_returnMax)/ui8_dataMax);
+}
+
+uint8_t AbsoluteValue(uint8_t Value){
+	if(Value < 0){
+		Value*=(-1);
+	}
+	return Value;
+}
+
+void ResetMotor(void){
+	ForwardPWM(0);
+	BackwardPWM(0);
+	LOG_Struct.PWMLOG=0;
+}
+
+void ForwardPWM(uint8_t pwmPulse){				//PC6 - LPWM
+	TIM_OCStruct.TIM_Pulse=pwmPulse;
+	TIM_OC1Init(TIM3,&TIM_OCStruct);
+	TIM_OC1PreloadConfig(TIM3,TIM_OCPreload_Enable);
+}
+
+void BackwardPWM(uint8_t pwmPulse){				//PC7 - RPWM
+	TIM_OCStruct.TIM_Pulse=pwmPulse;
+	TIM_OC2Init(TIM3,&TIM_OCStruct);
+	TIM_OC2PreloadConfig(TIM3,TIM_OCPreload_Enable);
+}
+
+void DelayMs(uint16_t delayTime_MS){
+	ui16_delayCounter=delayTime_MS;
+	while(ui16_delayCounter);	
+}
+
+void ReadEMG(uint8_t Threshold){			//With signal processing.
+	Threshold-=4;
+	ui8_ADCData_EMG1=ADC2_ReadEMG1();
+	ui8_ADCData_EMG2=ADC2_ReadEMG2();		//If the signal is smaller than threshold, equalise it to threshold.
+											//If the signal is bigger than threshold+gap, equalise it.
+	if(ui8_ADCData_EMG1 <= Threshold){		//This is for limitation of EMG signals.
+		ui8_ADCData_EMG1 = Threshold;
+	}
+	if(ui8_ADCData_EMG1 > Threshold+GAP){
+		ui8_ADCData_EMG1 = Threshold+GAP;
+	}
+	if(ui8_ADCData_EMG2 <= Threshold){
+		ui8_ADCData_EMG2 = Threshold;
+	}
+	if(ui8_ADCData_EMG2 > Threshold+GAP){
+		ui8_ADCData_EMG2 = Threshold+GAP;
+	}
+
+	if(ui8_ADCData_EMG1 < ui8_EMG1LOG){
+		ui8_ADCData_EMG1 = ui8_EMG1LOG-1;	//If current EMG signal is smaller than it's previous.
+	}										//Decrease it slowly.
+	if(ui8_ADCData_EMG2 < ui8_EMG2LOG){		//It will provide nice and soft signal.
+		ui8_ADCData_EMG2 = ui8_EMG2LOG-1;
+	}
+	ui8_EMG1LOG=ui8_ADCData_EMG1;
+	ui8_EMG2LOG=ui8_ADCData_EMG2;
+}
+
+void StopMotor(void){
+	if(LOG_Struct.PWMLOG != 0){
+		if(0 == LOG_Struct.STATUS){		//This if blocks for stopping motor slowly. It needs direction.
+			for(ui8_loopCounter=LOG_Struct.PWMLOG; ui8_loopCounter>0 ;ui8_loopCounter--){
+				if(RESET != ui8_resetFlag){	//This is for stop to loop after EXTI.
+					ResetMotor();
+					ui8_resetFlag=RESET;
+					break;
+				}
+
+				ReadEMG(THRESHOLD);
+				if(ui8_ADCData_EMG1 > THRESHOLD || ui8_ADCData_EMG2 > THRESHOLD){	//Stop the stopping motor.
+					break;															//Drive the motor current signals. 
+				}																	
+				ForwardPWM(ui8_loopCounter);									
+				LOG_Struct.PWMLOG=ui8_loopCounter;
+				DelayMs(8);														//Stop it slowly.
+			}																	
+			ResetMotor();
+		}else if(1 == LOG_Struct.STATUS){
+			for(ui8_loopCounter=LOG_Struct.PWMLOG; ui8_loopCounter>0 ;ui8_loopCounter--){
+				if(RESET != ui8_resetFlag){	//This is for stop to loop after EXTI.
+					ResetMotor();
+					ui8_resetFlag=RESET;
+					break;
+				}
+
+				ReadEMG(THRESHOLD);
+				if(ui8_ADCData_EMG1 > THRESHOLD || ui8_ADCData_EMG2 > THRESHOLD){
+					break;
+				}
+				BackwardPWM(ui8_loopCounter);
+				LOG_Struct.PWMLOG=ui8_loopCounter;
+				DelayMs(8);
+			}
+			ResetMotor();
+		}
+	}
+	ResetMotor();
+}
+
+void MoveForward(uint8_t ui8_Pulse){
+	BackwardPWM(0);						//Reset the other way.
+	if(0 != LOG_Struct.STATUS){		  	//If previous movement is not forward.
+		LOG_Struct.STATUS=0;			//Movement Log STATUS bit updated.
+		for(ui8_loopCounter=0;ui8_loopCounter<ui8_Pulse;ui8_loopCounter++){
+			if(RESET != ui8_resetFlag){	//This is for stop to loop after EXTI.
+				ResetMotor();
+				ui8_resetFlag=RESET;
+				break;
+			}
+			ForwardPWM(ui8_loopCounter);
+			LOG_Struct.PWMLOG=ui8_loopCounter;	//Movement Log PWM updated.
+			DelayMs(2);
+		}
+	}else if(0 == LOG_Struct.STATUS){		//If previous is forward
+		if(LOG_Struct.PWMLOG < ui8_Pulse){	//If signal is bigger than previous signal increase it.
+			for(ui8_loopCounter=LOG_Struct.PWMLOG; ui8_loopCounter<ui8_Pulse; ui8_loopCounter++){
+				if(RESET != ui8_resetFlag){	//This is for stop to loop after EXTI.
+					ResetMotor();
+					ui8_resetFlag=RESET;
+					break;
+				}
+				ForwardPWM(ui8_loopCounter);
+				LOG_Struct.PWMLOG=ui8_loopCounter;
+				DelayMs(2);
+			}
+		}else{								//If signal is smaller(or equal) than previous signal decrease it.
+			for(ui8_loopCounter=LOG_Struct.PWMLOG; ui8_loopCounter>ui8_Pulse; ui8_loopCounter--){
+				if(RESET != ui8_resetFlag){	//This is for stop to loop after EXTI.
+					ResetMotor();
+					ui8_resetFlag=RESET;
+					break;
+				}
+				ForwardPWM(ui8_loopCounter);
+				LOG_Struct.PWMLOG=ui8_loopCounter;
+				DelayMs(2);
+			}
+		}
+	}
+
+
+}
+
+void MoveBackward(uint8_t ui8_Pulse){
+	ForwardPWM(0);	//Diğer taraf açıksa kapatır
+	if(1 != LOG_Struct.STATUS){		//önceki hareket backward değilse
+		LOG_Struct.STATUS=1;			//Movement Log STATUS bit updated.
+		for(ui8_loopCounter=0;ui8_loopCounter<ui8_Pulse;ui8_loopCounter++){
+			if(RESET != ui8_resetFlag){	//This is for stop to loop after EXTI.
+				ResetMotor();
+				ui8_resetFlag=RESET;
+				break;
+			}
+			BackwardPWM(ui8_loopCounter);
+			LOG_Struct.PWMLOG=ui8_loopCounter;	//hareket gücü tutuldu
+			DelayMs(2);
+		}
+	}else if(1 == LOG_Struct.STATUS){	//If previous is backward
+		if(LOG_Struct.PWMLOG < ui8_Pulse){	//If signal is bigger than previous signal increase it.
+			for(ui8_loopCounter=LOG_Struct.PWMLOG; ui8_loopCounter<ui8_Pulse; ui8_loopCounter++){
+				if(RESET != ui8_resetFlag){	//This is for stop to loop after EXTI.
+					ResetMotor();
+					ui8_resetFlag=RESET;
+					break;
+				}
+				BackwardPWM(ui8_loopCounter);
+				LOG_Struct.PWMLOG=ui8_loopCounter;
+				DelayMs(2);
+			}
+		}else{								//If signal is smaller(or equal) than previous signal decrease it.
+			for(ui8_loopCounter=LOG_Struct.PWMLOG; ui8_loopCounter>ui8_Pulse; ui8_loopCounter--){
+				if(RESET != ui8_resetFlag){	//This is for stop to loop after EXTI.
+					ResetMotor();
+					ui8_resetFlag=RESET;
+					break;
+				}
+				BackwardPWM(ui8_loopCounter);
+				LOG_Struct.PWMLOG=ui8_loopCounter;
+				DelayMs(2);
+			}
+		}
+	}
+}
+
+void InitRoboLeg(void){
+	SysTick_Config(SystemCoreClock/1000);
+	Config_GPIO();
+	Config_ADC2();
+	Config_TIM3();
+	Config_EXTI();
+	LOG_Struct.PWMLOG=0;
+	LOG_Struct.STATUS=0;
+	ui8_EMG2LOG=ui8_EMG1LOG=0;
+	ResetMotor();
+	GPIO_SetBits(GPIOD,GPIO_Pin_0|GPIO_Pin_1|GPIO_Pin_2);
+ 	DelayMs(5000);
+}
+
+void SetPower(uint8_t Ratio){
+	ui8_EMGSignalDifference=AbsoluteValue(ui8_ADCData_EMG1-ui8_ADCData_EMG2);
+	i16_pwmPulse=ui8_EMGSignalDifference*Ratio;
+	if(i16_pwmPulse>255){
+		i16_pwmPulse=255;
+	}else if(i16_pwmPulse<0){
+		i16_pwmPulse=0;
+	}
+	i16_pwmPulse=MAP(i16_pwmPulse,0,255,0,64);					//TIMER configurated between 0-99
+}
+
+void runRoboLeg(uint8_t Threshold,uint8_t Ratio){
+	ReadEMG(Threshold);
+	if(ui8_ADCData_EMG1 > Threshold || ui8_ADCData_EMG2 > Threshold){
+		if(ui8_ADCData_EMG1>ui8_ADCData_EMG2+COLLISION){
+			SetPower(Ratio);
+			MoveForward(i16_pwmPulse);
+			DelayMs(125);
+		}else if(ui8_ADCData_EMG2>ui8_ADCData_EMG1+COLLISION){
+			SetPower(Ratio);
+			MoveBackward(i16_pwmPulse);
+			DelayMs(125);
+		}
+	}else{
+		StopMotor();
+	}
+}
+
+int main(void)
+{
+ 	InitRoboLeg();
+	while(1){
+		runRoboLeg(THRESHOLD,RATIO);
+	}
+}
+
+
+
+void EVAL_AUDIO_TransferComplete_CallBack(uint32_t pBuffer, uint32_t Size){
+  return;
+}
+uint16_t EVAL_AUDIO_GetSampleCallBack(void){
+  return -1;
+}
